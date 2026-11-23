@@ -22,12 +22,16 @@
     # service list rather than skipped via 'docker compose up' (which has no
     # native "all except X" flag). The filtered list is guarded so an empty arg
     # list never makes 'docker compose up' start ALL services.
+    # build_node is never started here, whatever the inventory lists: its
+    # config is rendered in misc.yml once the build node token is issued, and
+    # without the config file docker would create a directory in its place.
     - name: Create and start non-excluded services
       vars:
         included_services: >-
           {{ services.stdout_lines
              | difference(excluded_containers)
-             | difference(pre_bootstrap_excluded_containers | default([])) }}
+             | difference(pre_bootstrap_excluded_containers | default([]))
+             | difference(['build_node']) }}
       shell: >-
         {{ docker_compose }} -p {{ container_name_prefix }} --compatibility
         up -d --build --force-recreate {{ included_services | join(' ') }}
@@ -36,20 +40,6 @@
       when: included_services | length > 0
   when:
     - docker_compose != "not found"
-    - (excluded_containers | length > 0) or (pre_bootstrap_excluded_containers | default([]) | length > 0)
-
-- name: Create and start services
-  shell: "{{ docker_compose }} -p {{ container_name_prefix }} --compatibility up -d --build --force-recreate"
-  args:
-    chdir: "{{ sources_root }}/albs-web-server"
-  register: output
-  when:
-    - docker_compose != "not found"
-    - excluded_containers | length == 0
-    - pre_bootstrap_excluded_containers | default([]) | length == 0
-
-- debug:
-    var: output
 
 - name: Fail if docker-compose not found
   fail:

@@ -1,0 +1,138 @@
+---
+# The build nodes get a token of a build node service user of albs-web-server
+# (users.is_build_node): it's accepted by /api/v1/build_node/* only. They never
+# get the superuser albs_jwt of the other services: without a build node token,
+# or with a token the web server doesn't take for a build node one, the role
+# fails.
+
+# The tasks handling the token have no_log, so it doesn't get into the output
+# even with -vvv; their errors are reported by the tasks without it.
+- name: Use the build node token set via vars.yml
+  ansible.builtin.set_fact:
+    albs_build_node_jwt: "{{ albs_build_node_jwt_token | trim }}"
+  when: albs_build_node_jwt_token | default('', true) | trim | length > 0
+  no_log: true
+
+- name: Issue the build node token
+  when: albs_build_node_jwt_token | default('', true) | trim | length == 0
+  block:
+    - name: Check if albs-web-server can issue build node tokens
+      community.docker.docker_container_exec:
+        container: "{{ container_name_prefix }}_web_server_1"
+        command: test -f scripts/build_node_token.py
+      register: build_node_token_script
+      changed_when: false
+      failed_when: build_node_token_script.rc not in [0, 1]
+
+    - name: Fail without a way to get a build node token
+      ansible.builtin.fail:
+        msg: >-
+          albs-web-server has no scripts/build_node_token.py, so it can't issue
+          a token of the build node role, and the build nodes don't get the
+          superuser token. Deploy albs-web-server with the build node users
+          or set albs_build_node_jwt_token to a build node token issued
+          beforehand.
+      when: build_node_token_script.rc != 0
+
+    # The user is created by the first run. A later run issues one more token
+    # of the same user: the tokens issued earlier stay valid, they're revoked
+    # only with 'build_node_token.py -u <user> --revoke'. A token without
+    # expiry is the same for the same user, so the config doesn't change.
+    # The token is the only output on stdout, the log goes to stderr.
+    - name: Issue a token of the build node user
+      community.docker.docker_container_exec:
+        container: "{{ container_name_prefix }}_web_server_1"
+        argv:
+          - python3
+          - scripts/build_node_token.py
+          - --username
+          - "{{ albs_build_node_user | default('build-nodes', true) }}"
+      register: issued_build_node_jwt
+      # misc.yml waits for the web server, the retries are for a DB hiccup;
+      # a failure is reported by the next task once they run out
+      until: issued_build_node_jwt.rc | default(1) == 0
+      retries: 3
+      delay: 10
+      changed_when: >-
+        'Created build node user' in issued_build_node_jwt.stderr | default('')
+      failed_when: false
+      no_log: true
+
+    # The log of the script (stderr) has no token, the last lines tell why
+    # it failed, e.g. "User build-nodes is revoked, choose another username"
+    - name: Fail if the build node token wasn't issued
+      ansible.builtin.fail:
+        msg: >-
+          scripts/build_node_token.py failed with exit code
+          {{ issued_build_node_jwt.rc | default('unknown') }}:
+          {{ issued_build_node_jwt.stderr_lines | default([])
+             | reject('search', 'engine startup') | list | last
+             | default(issued_build_node_jwt.msg | default('no output')) }}
+      when: issued_build_node_jwt.rc | default(1) != 0
+
+    - name: Set the build node token fact
+      ansible.builtin.set_fact:
+        albs_build_node_jwt: "{{ issued_build_node_jwt.stdout | trim }}"
+      no_log: true
+
+- name: Check that the build node token is a JWT
+  ansible.builtin.assert:
+    that:
+      - albs_build_node_jwt is defined
+      - albs_build_node_jwt is string
+      - albs_build_node_jwt is match('^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$')
+    fail_msg: >-
+      The build node token isn't a JWT. Set albs_build_node_jwt_token to a
+      token issued by 'python3 scripts/build_node_token.py -u <user>' in the
+      web-server container, or leave it empty to issue one.
+    quiet: true
+
+# The web server tells whose token it is: /api/v1/roles/ is a read-only
+# endpoint for any signed-in user (get_current_user), which rejects the build
+# node users with 403 "The token of a build node gives access to
+# /build_node/* only". 200 is a token of a regular user or a superuser (e.g.
+# albs_jwt_token), which the build nodes never get, 401 is an invalid or
+# revoked token. /build_node/ping isn't asked: it registers a build node.
+- name: Ask the web server whose token the build node token is
+  ansible.builtin.uri:
+    url: "{{ albs_deploy_api_url }}roles/"
+    method: GET
+    headers:
+      accept: application/json
+      Authorization: "Bearer {{ albs_build_node_jwt }}"
+    status_code: [200, 401, 403]
+  register: build_node_jwt_probe
+  until: build_node_jwt_probe.status | default(-1) in [200, 401, 403]
+  retries: 6
+  delay: 5
+  failed_when: false
+  # A read-only request: it's sent in check mode too, the check below needs
+  # its answer
+  check_mode: false
+  no_log: true
+
+- name: Check that the web server takes it for a build node token
+  ansible.builtin.assert:
+    that:
+      - build_node_jwt_probe.status | default(-1) == 403
+      - >-
+        'build node' in (build_node_jwt_probe.json.detail | default('') | string)
+    fail_msg: >-
+      {%- set status = build_node_jwt_probe.status | default(-1) -%}
+      {%- if status == 200 -%}
+      The build node token is accepted by the whole API ({{ albs_deploy_api_url }}roles/
+      answered 200): it's a token of a regular user or a superuser (e.g.
+      albs_jwt_token), not of a build node user, and the build nodes never
+      get such tokens.{%- elif status == 401 -%}
+      The web server rejects the build node token (401): it's invalid, signed
+      with another JWT secret, or its user is revoked.{%- elif status == 403 -%}
+      The web server answered 403 to the build node token, but not as to a
+      build node user: {{ build_node_jwt_probe.json.detail | default('no detail') }}.{%- else -%}
+      The web server didn't answer the check of the build node token at
+      {{ albs_deploy_api_url }}roles/ (status {{ status }}):
+      {{ build_node_jwt_probe.msg | default('no message') }}.{%- endif %}
+      Set albs_build_node_jwt_token to a token issued by
+      'python3 scripts/build_node_token.py -u <user>' in the web-server
+      container, or leave it empty to issue one.
+    quiet: true
+...

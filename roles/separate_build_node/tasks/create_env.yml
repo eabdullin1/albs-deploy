@@ -18,6 +18,107 @@
     group: "{{ service_group }}"
   with_items: "{{ working_directories }}"
 
+# The way albs-node names itself when build_node_name isn't set
+- name: Set the name the build node registers with
+  tags:
+    - update
+    - update-config
+  ansible.builtin.set_fact:
+    build_node_registered_name: >-
+      {{ build_node_name | default(ansible_facts['nodename'].rsplit('.', 2)[0], true) }}
+
+# Only the nodes of this play are compared
+- name: Check that the build node names are unique
+  tags:
+    - update
+    - update-config
+  run_once: true
+  vars:
+    build_node_names: >-
+      {{ ansible_play_hosts | map('extract', hostvars, 'build_node_registered_name') | list }}
+  ansible.builtin.assert:
+    that: build_node_names | unique | length == build_node_names | length
+    fail_msg: >-
+      The build node names {{ build_node_names }} aren't unique: the nodes with
+      the same name share one record of the build nodes registry. Set a unique
+      build_node_name for every node.
+    quiet: true
+
+# The web server tells whose token it is, asked from the node at master_url
+# of its config (albs_api_url): /api/v1/roles/ is a read-only endpoint for any
+# signed-in user (get_current_user), which rejects the build node users with
+# 403 "The token of a build node gives access to /build_node/* only". 200 is
+# a token of a regular user or a superuser (e.g. albs_jwt_token), which the
+# node never gets, 401 is an invalid or revoked token. /build_node/ping isn't
+# asked: it registers a build node.
+# The probe has no_log, so its URL is checked here to get a readable error
+- name: Check the web server API URL of the build node
+  tags:
+    - update
+    - update-config
+  ansible.builtin.assert:
+    that:
+      - albs_api_url is defined
+      - albs_api_url is string
+      - albs_api_url is match('^https?://')
+    fail_msg: >-
+      albs_api_url (master_url of the build node config, e.g.
+      https://build.example.com/api/v1/) isn't set or isn't an HTTP URL.
+    quiet: true
+
+- name: Ask the web server whose token the build node token is
+  tags:
+    - update
+    - update-config
+  vars:
+    build_node_jwt_probe_url: "{{ albs_api_url | regex_replace('/*$', '/') }}roles/"
+  ansible.builtin.uri:
+    url: "{{ build_node_jwt_probe_url }}"
+    method: GET
+    headers:
+      accept: application/json
+      Authorization: "Bearer {{ albs_build_node_jwt_token | trim }}"
+    status_code: [200, 401, 403]
+  register: build_node_jwt_probe
+  until: build_node_jwt_probe.status | default(-1) in [200, 401, 403]
+  retries: 6
+  delay: 5
+  failed_when: false
+  # A read-only request: it's sent in check mode too, the check below needs
+  # its answer
+  check_mode: false
+  no_log: true
+
+- name: Check that the web server takes it for a build node token
+  tags:
+    - update
+    - update-config
+  vars:
+    build_node_jwt_probe_url: "{{ albs_api_url | regex_replace('/*$', '/') }}roles/"
+  ansible.builtin.assert:
+    that:
+      - build_node_jwt_probe.status | default(-1) == 403
+      - >-
+        'build node' in (build_node_jwt_probe.json.detail | default('') | string)
+    fail_msg: >-
+      {%- set status = build_node_jwt_probe.status | default(-1) -%}
+      {%- if status == 200 -%}
+      albs_build_node_jwt_token is accepted by the whole API
+      ({{ build_node_jwt_probe_url }} answered 200): it's a token of a regular
+      user or a superuser (e.g. albs_jwt_token), not of a build node user,
+      and the build node never gets such tokens.{%- elif status == 401 -%}
+      The web server rejects albs_build_node_jwt_token (401): it's invalid,
+      signed with another JWT secret, or its user is revoked.{%- elif status == 403 -%}
+      The web server answered 403 to albs_build_node_jwt_token, but not as to
+      a build node user: {{ build_node_jwt_probe.json.detail | default('no detail') }}.{%- else -%}
+      The node couldn't check albs_build_node_jwt_token: the web server didn't
+      answer at {{ build_node_jwt_probe_url }} (status {{ status }}):
+      {{ build_node_jwt_probe.msg | default('no message') }}.{%- endif %}
+      Issue it in the web-server container with 'python3
+      scripts/build_node_token.py -u build-nodes' (shared by the nodes) or
+      '-u <user> -n <build_node_name>' (one node only).
+    quiet: true
+
 - name: Generate build node config
   tags:
     - update

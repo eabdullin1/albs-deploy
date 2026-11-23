@@ -67,6 +67,8 @@ excluded_containers:
 # so a human cannot race the bootstrap by signing in via OAuth and
 # grabbing id=1 ahead of the system user. They are started later from
 # misc.yml after the system user is created.
+# build_node isn't listed: the dev_deploy role itself starts it only after
+# its token is issued and its config is rendered.
 pre_bootstrap_excluded_containers:
   - "nginx"
 
