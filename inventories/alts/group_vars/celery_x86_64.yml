@@ -1,13 +1,5 @@
 ---
 
-# i686 tasks run on x86_64 workers, pull native i386 images for them
-# instead of falling back to x86_64 ones (no multilib depsolving issues)
-docker_image_overrides:
-  - dist_name: almalinux
-    dist_versions: ['8', '9', '10', '10-kitten']
-    platform: linux/386
-    image: quay.io/almalinuxautobot/almalinux
-
 # EPEL "ansible" needs ansible-core from AppStream, which the i686 repos
 # don't ship, so don't fail i686 provisioning on it
 ignore_ansible_install_errors: true

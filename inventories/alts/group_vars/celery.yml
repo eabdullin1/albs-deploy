@@ -33,11 +33,17 @@ broker_pool: 30
 # Optional overrides for environment provisioning
 # cleanup_yum_conf_docs_settings: false
 # ignore_ansible_install_errors: true
-# docker_image_overrides:
-#   - dist_name: almalinux
-#     dist_versions: ['8', '9']
-#     platform: linux/386
-#     image: quay.io/almalinuxautobot/almalinux
+
+# Init images (systemd as PID 1) of the docker environments, the only
+# source of them in ALTS: "<dist_name>-<dist_version>" of the task, or
+# "<dist_name>-<dist_version>-<dist_arch>" for one architecture. A task
+# of a platform missing here fails. The tags are multi-arch, linux/386
+# included, so i686 tasks on x86_64 workers get native i386 images
+docker_images:
+  almalinux-8: "almalinux/8-init:8"
+  almalinux-9: "almalinux/9-init:9"
+  almalinux-10: "almalinux/10-init:10"
+  almalinux-10-kitten: "almalinux/10-kitten-init:10-kitten"
 
 celery_log_file_dir: /var/log/celery
 celery_log_file: "{{ celery_log_file_dir }}/celery.log"
